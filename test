@@ -1,0 +1,843 @@
+#samstart
+import asyncio
+#samend
+import logging
+import xml.etree.ElementTree as et
+
+#samstart
+import aiofiles
+#samend
+import numpy as np
+import pandas as pd
+
+from util.zip import open_file
+
+logger = logging.getLogger(__name__)
+
+XML_VERSION_KEY = "version"
+TYPE_MAP = {"d": "<f8", "Q": "<u8", "q": "<i8", "L": "<u4"}
+
+# Map old netcat variable names to current names
+netcat_var_migrate_map = {
+    "AzPositionDemand": "az_pos_error_deg",
+    "ElPositionDemand": "el_pos_error_deg",
+    "XElPositionDemand": "xel_pos_error_deg",
+    "PolPositionDemand": "pol_pos_error_deg",
+    "AzVelocityDemand": "az_vel_error_deg_s",
+    "ElVelocityDemand": "el_vel_error_deg_s",
+    "XElVelocityDemand": "xel_vel_error_deg_s",
+    "PolVelocityDemand": "pol_vel_error_deg_s",
+    "AzTorqueDemand": "az_torque_demand_nm",
+    "ElTorqueDemand": "el_torque_demand_nm",
+    "XElTorqueDemand": "xel_torque_demand_nm",
+    "PolTorqueDemand": "pol_torque_demand_nm",
+}
+
+#samstart
+async def readxml_async(xml_path):
+    async with aiofiles.open(xml_path, mode='r') as f:
+        content = await f.read()
+    xml_elements = et.fromstring(content)
+    # This part of the logic remains mostly the same, just within an async function
+    (vars, index_seen, packfmt) = ([], [], "<")
+    dataversion = _get_data_version(xml_elements)
+
+    for element in xml_elements:
+        index = int(element.find("elementIdx").text) - 1
+
+        if index not in index_seen:
+            index_seen.append(index)
+            packfmt = _append_data_type_to_format(element, packfmt)
+
+            name = element.find("ioa_name").text
+            name = netcat_var_migrate_map.get(name, name)
+
+            while name in vars:
+                logger.error(f"Error! Duplicate name in XML. [{index}] '{name}'")
+                name = "[DUPE]" + name
+            vars.append(name)
+
+    npfmt = np.dtype([(k, TYPE_MAP[t]) for k, t in zip(vars, list(packfmt[1:]), strict=False)])
+
+    return (vars, dataversion, npfmt)
+#samend
+
+
+def _get_data_version(xml_elements: et.Element):
+    dataversion = xml_elements.attrib.get("dataversion")
+    if dataversion:
+        dataversion = int(dataversion, 0)
+    return dataversion
+
+
+def _append_data_type_to_format(element: et.Element, packfmt: str):
+    match element.find("type").text:
+        case "double":
+            packfmt += "d"
+        case "unsigned":
+            packfmt += "Q"
+        case "signed":
+            packfmt += "q"
+    return packfmt
+
+#samstart
+async def load_dat_async(netcat_data_path, npfmt, dataversion=None, validate=True):
+    """Load netcat data from .dat asynchronously"""
+    async with aiofiles.open(netcat_data_path, mode='rb') as netcat_data:
+        if validate:
+            # Replaced synchronous call with async version
+            is_valid = await validate_xml_buffer_async(npfmt, netcat_data, dataversion)
+            if not is_valid:
+                return None
+            # Seeking in aiofiles is also an awaitable operation
+            await netcat_data.seek(0)
+
+        frames = []
+        while True:
+            # Replaced synchronous call with async version
+            frame = await _unpack_next_packet_async(netcat_data, npfmt)
+            if frame is None:
+                break
+            frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.DataFrame(np.concatenate(frames))
+#samend
+
+#samstart
+async def _read_length_from_buffer_async(netcat_data):
+    # Replaced netcat_data.read(4) with an awaitable version
+    lenbuf = await netcat_data.read(4)
+    if not lenbuf:
+        return None
+    return np.frombuffer(lenbuf, np.int32)[0]
+#samend
+
+#samstart
+async def _unpack_next_packet_async(netcat_data, npfmt):
+    # Replaced synchronous calls with async versions
+    packet_length = await _read_length_from_buffer_async(netcat_data)
+    if packet_length is None:
+        return
+
+    packet = await netcat_data.read(packet_length)
+    if len(packet) != packet_length:
+        return
+
+    return np.frombuffer(packet, dtype=npfmt)
+#samend
+
+
+def convert_packet_to_dataframe(netcat_packet, npfmt):
+    return pd.DataFrame(np.frombuffer(netcat_packet, dtype=npfmt))
+
+#samstart
+async def validate_xml_buffer_async(npfmt, buffer, dataversion):
+    """Validate xml from a netcat buffer asynchronously"""
+    # Replaced synchronous calls with async versions
+    packet_length = await _read_length_from_buffer_async(buffer)
+    if not packet_length:
+        return False
+    packet = await buffer.read(packet_length)
+    # The actual validation logic is CPU-bound, so it remains synchronous
+    return validate_xml_packet(packet_length, npfmt, dataversion, packet)
+#samend
+
+
+def validate_xml_packet(packet_length, npfmt, dataversion, packet):
+    if not validate_xml_packet_length(packet_length, npfmt):
+        return False
+
+    netcat_dataframe = pd.DataFrame(np.frombuffer(packet, dtype=npfmt))
+
+    verified = validate_xml_data_version(dataversion, netcat_dataframe)
+    if verified:
+        logger.info("XML verification complete!")
+    return verified
+
+
+def validate_xml_packet_length(packet_length, npfmt):
+    if npfmt.itemsize == 0 or packet_length % npfmt.itemsize != 0:
+        logger.error("XML verification failed: The netcat packet is not a multiple of the number of xml variables")
+        return False
+    logger.debug("XML packet length successfully verified")
+    return True
+
+
+def validate_xml_data_version(dataversion, netcat_dataframe):
+    """Verify the dataversion in the netcat data matches the dataversion in the xml file if present"""
+    if not dataversion:
+        logger.debug("Could not verify the XML version number. The XML file does not contain a data version number.")
+        return True
+
+    if XML_VERSION_KEY not in netcat_dataframe.columns:
+        logger.warning(
+            "Could not verify the XML version number. The version number column is not present in the netcat data"
+        )
+        return True
+
+    if dataversion != netcat_dataframe[XML_VERSION_KEY].iloc[0]:
+        logger.error("XML verification failed: The XML data version does not match the version in the netcat data")
+        return False
+
+    logger.info("XML dataversion successfully verified")
+    return True
+
+#samstart
+# Added an async main function to run the asynchronous code
+async def main():
+    # --- Example Usage ---
+    # NOTE: Replace with your actual file paths
+    xml_file_path = 'path/to/your/file.xml'
+    dat_file_path = 'path/to/your/file.dat'
+
+    try:
+        vars, dataversion, npfmt = await readxml_async(xml_file_path)
+        df = await load_dat_async(dat_file_path, npfmt, dataversion)
+        if df is not None:
+            print("Successfully loaded data:")
+            print(df.head())
+    except FileNotFoundError:
+        print(f"Error: One of the files was not found. Please check the paths.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Standard Python entry point to run the asyncio event loop
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+#samend
+
+
+tmreader
+import asyncio
+import logging
+import zlib
+from asyncio import Lock
+
+import aiofiles
+import numpy as np
+
+from util.netcat.netcat import validate_xml_packet
+
+
+class TmDataReader:
+    """Class for reading and recording netcat data from a TM"""
+
+    def __init__(
+        self,
+        ip,
+        addr,
+        on_connect_callback=None,
+        on_disconnect_callback=None,
+        on_verify_xml=None,
+        on_reject_xml=None,
+        on_packet_receive=None,
+        on_connection_failed_callback=None,
+    ):
+        self.logger = logging.getLogger(__name__)
+        self.netcat_file_writer_lock = Lock()
+        self.netcat_file = None
+        self.writer = None
+        self.ip = ip
+        self.addr = addr
+
+        # callbacks
+        self.on_connect_callback = on_connect_callback
+        self.on_disconnect_callback = on_disconnect_callback
+        self.on_connection_failed_callback = on_connection_failed_callback
+        self.on_verify_xml = on_verify_xml
+        self.on_reject_xml = on_reject_xml
+        self.on_packet_receive = on_packet_receive
+
+        # init xml related variables
+        self.reset_xml_vars()
+        self.xml_verified = False
+
+    def set_xml_vars(self, vars, dataversion, npfmt):
+        self.xml_vars = vars
+        self.xml_dataversion = dataversion
+        self.xml_npfmt = npfmt
+        self.xml_verified = False
+
+    def reset_xml_vars(self):
+        (self.xml_vars, self.xml_dataversion, self.xml_npfmt) = (None, None, None)
+
+    def set_ip(self, ip):
+        self.ip = ip
+
+    def set_port(self, port):
+        self.port = port
+
+    async def connect_to_socket(self):
+        """Initiate connection with terminal socket"""
+        self.logger.info(f"Attempting to connect to socket on '{self.ip}:{self.port}'")
+        try:
+            # attempt to connect to the socket, if a connection is not made within 3 seconds then try again
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.ip, self.port, limit=100e6), timeout=1
+            )
+
+            # call the on_connect event callback if registered
+            if self.on_connect_callback:
+                self.on_connect_callback()
+
+            # require xml verification with new connection
+            self.xml_verified = False
+            self.logger.info(f"Successfully connected to socket on '{self.ip}:{self.port}'")
+            return
+        except asyncio.exceptions.TimeoutError:
+            self.logger.error(
+                "Connection to TM timed out. A connection could not be established in the allowed time frame"
+            )
+            if self.on_connection_failed_callback:
+                self.on_connection_failed_callback()
+        except (ConnectionRefusedError, OSError) as e:
+            self.logger.error(f"Error connecting to socket on '{self.ip}:{self.port}': {e}")
+            if self.on_connection_failed_callback:
+                self.on_connection_failed_callback()
+
+    async def close_socket(self):
+        if self.writer:
+            self.writer.close()
+            self.logger.debug("close_socket(): Waiting to close the netcat socket writer object")
+            await self.writer.wait_closed()
+            self.writer = None
+            self.logger.info("Netcat socket closed")
+
+    async def read_tm_data(self):
+        try:
+            await self.connect_to_socket()
+            if not self.writer:
+                return
+            self.logger.info("Netcat reader loop started")
+            while True:
+                # read packet length from first 4 bytes
+                packet_len_buffer = await self.read_bytes_from_socket(4)
+                if not packet_len_buffer:
+                    self.logger.debug("Error reading packet length")
+                    break
+
+                #samstart
+                # convert packet_len_buffer to integer in a non-blocking way
+                packet_length = (await asyncio.to_thread(np.frombuffer, packet_len_buffer, dtype=np.int32))[0]
+                #samend
+
+                # read packet_length bytes from the socket
+                packet = await self.read_bytes_from_socket(packet_length)
+                if not packet:
+                    self.logger.debug("Error reading packet")
+                    break
+
+                # verify the xml file matches the netcat data
+                # this only needs to be done once each time an XML file is loaded
+                if not self.xml_verified and self.xml_vars:
+                    #samstart
+                    await self.verify_netcat_format_with_xml(packet_length, packet)
+                    #samend
+
+                async with self.netcat_file_writer_lock:
+                    # Lock the file so the compressor or underlying file doesn't
+                    # get removed between now and the write finishing
+                    if self.netcat_file:
+                        #samstart
+                        # The compressor might return a block at any time. Offload to another thread.
+                        if compressed_data := await asyncio.to_thread(self.netcat_compressor.compress, packet_len_buffer):
+                            await self.netcat_file.write(compressed_data)
+                        if compressed_data := await asyncio.to_thread(self.netcat_compressor.compress, packet):
+                            await self.netcat_file.write(compressed_data)
+                        #samend
+
+        except asyncio.CancelledError:
+            # task has been cancelled. close socket and return
+            self.logger.debug("read_tm_data(): Task has been cancelled")
+
+        if self.on_disconnect_callback:
+            self.on_disconnect_callback()
+
+        await self.close_socket()
+        raise asyncio.CancelledError
+
+    async def read_bytes_from_socket(self, num_bytes):
+        try:
+            return await self.reader.readexactly(num_bytes)
+        except (ConnectionResetError, asyncio.exceptions.IncompleteReadError, ConnectionAbortedError) as e:
+            self.logger.error(f"Error reading {num_bytes} from the socket: {e}")
+
+    #samstart
+    async def verify_netcat_format_with_xml(self, packet_length, packet):
+    #samend
+        """Verify the netcat data with the xml file
+
+        Check that the dataversions match if present.
+        And that the length of the netcat packet is a multiple of the number of xml variables.
+        These checks are performed by util functions within the netcat.py file
+        """
+        self.logger.info("Verifying XML file with received netcat data")
+        #samstart
+        # Offload the synchronous, potentially CPU-bound validation to a separate thread
+        is_valid = await asyncio.to_thread(
+            validate_xml_packet, packet_length, self.xml_npfmt, self.xml_dataversion, packet
+        )
+        if is_valid:
+        #samend
+            # xml verification successful
+            self.accept_xml()
+            return
+
+        # xml verification failed
+        self.reject_xml()
+
+    def reject_xml(self):
+        self.reset_xml_vars()
+        if self.on_reject_xml:
+            self.on_reject_xml()
+
+    def accept_xml(self):
+        self.xml_verified = True
+        if self.on_verify_xml:
+            self.on_verify_xml()
+
+    async def open_netcat_file(self, filename):
+        self.logger.info(f"Open netcat file for logging: '{filename}'")
+
+        await self.close_netcat_file()
+        self.netcat_compressor = get_gzip_encoder()
+        async with self.netcat_file_writer_lock:
+            self.netcat_file = await aiofiles.open(filename, "wb")
+
+    async def close_netcat_file(self):
+        self.logger.info("Closing netcat file")
+        #samstart
+        async with self.netcat_file_writer_lock:
+            if self.netcat_file:
+                # Offload the blocking flush call to a separate thread
+                flushed_data = await asyncio.to_thread(self.netcat_compressor.flush)
+                await self.netcat_file.write(flushed_data)
+                await self.netcat_file.close()
+                self.netcat_compressor = None
+                self.netcat_file = None
+        #samend
+
+
+def get_gzip_encoder():
+    return zlib.compressobj(
+        1,  # compression level: 0-9
+        zlib.DEFLATED,  # method: must be DEFLATED
+        16 + zlib.MAX_WBITS,  # window size in bits:
+        #   -15..-8: negate, suppress header
+        #   8..15: normal
+        #   16..30: subtract 16, gzip header
+        zlib.DEF_MEM_LEVEL,  # mem level: 1..8/9
+        0,  # strategy:
+        #   0 = Z_DEFAULT_STRATEGY
+        #   1 = Z_FILTERED
+        #   2 = Z_HUFFMAN_ONLY
+        #   3 = Z_RLE
+        #   4 = Z_FIXED
+    )
+
+
+
+# aloso:
+# Inside the read_tm_data loop
+loop = asyncio.get_running_loop()
+
+if self.netcat_file:
+    # Run the compression in a separate thread
+    compressed_data_len = await loop.run_in_executor(
+        None, self.netcat_compressor.compress, packet_len_buffer
+    )
+    if compressed_data_len:
+        await self.netcat_file.write(compressed_data_len)
+
+    compressed_data_packet = await loop.run_in_executor(
+        None, self.netcat_compressor.compress, packet
+    )
+    if compressed_data_packet:
+        await self.netcat_file.write(compressed_data_packet)
+
+
+# This method would need to become async
+async def verify_netcat_format_with_xml(self, packet_length, packet):
+    self.logger.info("Verifying XML file with received netcat data")
+
+    loop = asyncio.get_running_loop()
+    # Run the validation in a separate thread
+    is_valid = await loop.run_in_executor(
+        None, validate_xml_packet, packet_length, self.xml_npfmt, self.xml_dataversion, packet
+    )
+
+    if is_valid:
+        self.accept_xml()
+        return
+
+    self.reject_xml()
+
+
+tmreader2
+
+import asyncio
+import logging
+import zlib
+from asyncio import Lock
+
+import aiofiles
+import numpy as np
+
+from util.netcat.netcat import validate_xml_packet
+
+
+class TmDataReader:
+    """Class for reading and recording netcat data from a TM"""
+
+    def __init__(
+        self,
+        ip,
+        addr,
+        on_connect_callback=None,
+        on_disconnect_callback=None,
+        on_verify_xml=None,
+        on_reject_xml=None,
+        on_packet_receive=None,
+        on_connection_failed_callback=None,
+    ):
+        self.logger = logging.getLogger(__name__)
+        self.netcat_file_writer_lock = Lock()
+        self.netcat_file = None
+        self.writer = None
+        self.ip = ip
+        self.addr = addr
+
+        # callbacks
+        self.on_connect_callback = on_connect_callback
+        self.on_disconnect_callback = on_disconnect_callback
+        self.on_connection_failed_callback = on_connection_failed_callback
+        self.on_verify_xml = on_verify_xml
+        self.on_reject_xml = on_reject_xml
+        self.on_packet_receive = on_packet_receive
+
+        # init xml related variables
+        self.reset_xml_vars()
+        self.xml_verified = False
+
+    def set_xml_vars(self, vars, dataversion, npfmt):
+        self.xml_vars = vars
+        self.xml_dataversion = dataversion
+        self.xml_npfmt = npfmt
+        self.xml_verified = False
+
+    def reset_xml_vars(self):
+        (self.xml_vars, self.xml_dataversion, self.xml_npfmt) = (None, None, None)
+
+    def set_ip(self, ip):
+        self.ip = ip
+
+    def set_port(self, port):
+        self.port = port
+
+    async def connect_to_socket(self):
+        """Initiate connection with terminal socket"""
+        self.logger.info(f"Attempting to connect to socket on '{self.ip}:{self.port}'")
+        try:
+            # attempt to connect to the socket, if a connection is not made within 3 seconds then try again
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.ip, self.port, limit=100e6), timeout=1
+            )
+
+            # call the on_connect event callback if registered
+            if self.on_connect_callback:
+                self.on_connect_callback()
+
+            # require xml verification with new connection
+            self.xml_verified = False
+            self.logger.info(f"Successfully connected to socket on '{self.ip}:{self.port}'")
+            return
+        except asyncio.exceptions.TimeoutError:
+            self.logger.error(
+                "Connection to TM timed out. A connection could not be established in the allowed time frame"
+            )
+            if self.on_connection_failed_callback:
+                self.on_connection_failed_callback()
+        except (ConnectionRefusedError, OSError) as e:
+            self.logger.error(f"Error connecting to socket on '{self.ip}:{self.port}': {e}")
+            if self.on_connection_failed_callback:
+                self.on_connection_failed_callback()
+
+    async def close_socket(self):
+        if self.writer:
+            self.writer.close()
+            self.logger.debug("close_socket(): Waiting to close the netcat socket writer object")
+            await self.writer.wait_closed()
+            self.writer = None
+            self.logger.info("Netcat socket closed")
+
+    async def read_tm_data(self):
+        try:
+            await self.connect_to_socket()
+            if not self.writer:
+                return
+            self.logger.info("Netcat reader loop started")
+            while True:
+                # read packet length from first 4 bytes
+                packet_len_buffer = await self.read_bytes_from_socket(4)
+                if not packet_len_buffer:
+                    self.logger.debug("Error reading packet length")
+                    break
+
+                #samstart
+                # convert packet_len_buffer to integer in a non-blocking way
+                packet_length = (await asyncio.to_thread(np.frombuffer, packet_len_buffer, dtype=np.int32))[0]
+                #samend
+
+                # read packet_length bytes from the socket
+                packet = await self.read_bytes_from_socket(packet_length)
+                if not packet:
+                    self.logger.debug("Error reading packet")
+                    break
+
+                # verify the xml file matches the netcat data
+                # this only needs to be done once each time an XML file is loaded
+                if not self.xml_verified and self.xml_vars:
+                    #samstart
+                    await self.verify_netcat_format_with_xml(packet_length, packet)
+                    #samend
+
+                async with self.netcat_file_writer_lock:
+                    # Lock the file so the compressor or underlying file doesn't
+                    # get removed between now and the write finishing
+                    if self.netcat_file:
+                        #samstart
+                        # The compressor might return a block at any time. Offload to another thread.
+                        if compressed_data := await asyncio.to_thread(self.netcat_compressor.compress, packet_len_buffer):
+                            await self.netcat_file.write(compressed_data)
+                        if compressed_data := await asyncio.to_thread(self.netcat_compressor.compress, packet):
+                            await self.netcat_file.write(compressed_data)
+                        #samend
+
+        except asyncio.CancelledError:
+            # task has been cancelled. close socket and return
+            self.logger.debug("read_tm_data(): Task has been cancelled")
+
+        if self.on_disconnect_callback:
+            self.on_disconnect_callback()
+
+        await self.close_socket()
+        raise asyncio.CancelledError
+
+    async def read_bytes_from_socket(self, num_bytes):
+        try:
+            return await self.reader.readexactly(num_bytes)
+        except (ConnectionResetError, asyncio.exceptions.IncompleteReadError, ConnectionAbortedError) as e:
+            self.logger.error(f"Error reading {num_bytes} from the socket: {e}")
+
+    #samstart
+    async def verify_netcat_format_with_xml(self, packet_length, packet):
+    #samend
+        """Verify the netcat data with the xml file
+
+        Check that the dataversions match if present.
+        And that the length of the netcat packet is a multiple of the number of xml variables.
+        These checks are performed by util functions within the netcat.py file
+        """
+        self.logger.info("Verifying XML file with received netcat data")
+        #samstart
+        # Offload the synchronous, potentially CPU-bound validation to a separate thread
+        is_valid = await asyncio.to_thread(
+            validate_xml_packet, packet_length, self.xml_npfmt, self.xml_dataversion, packet
+        )
+        if is_valid:
+        #samend
+            # xml verification successful
+            self.accept_xml()
+            return
+
+        # xml verification failed
+        self.reject_xml()
+
+    def reject_xml(self):
+        self.reset_xml_vars()
+        if self.on_reject_xml:
+            self.on_reject_xml()
+
+    def accept_xml(self):
+        self.xml_verified = True
+        if self.on_verify_xml:
+            self.on_verify_xml()
+
+    async def open_netcat_file(self, filename):
+        self.logger.info(f"Open netcat file for logging: '{filename}'")
+
+        await self.close_netcat_file()
+        self.netcat_compressor = get_gzip_encoder()
+        async with self.netcat_file_writer_lock:
+            self.netcat_file = await aiofiles.open(filename, "wb")
+
+    async def close_netcat_file(self):
+        self.logger.info("Closing netcat file")
+        #samstart
+        async with self.netcat_file_writer_lock:
+            if self.netcat_file:
+                # Offload the blocking flush call to a separate thread
+                flushed_data = await asyncio.to_thread(self.netcat_compressor.flush)
+                await self.netcat_file.write(flushed_data)
+                await self.netcat_file.close()
+                self.netcat_compressor = None
+                self.netcat_file = None
+        #samend
+
+
+def get_gzip_encoder():
+    return zlib.compressobj(
+        1,  # compression level: 0-9
+        zlib.DEFLATED,  # method: must be DEFLATED
+        16 + zlib.MAX_WBITS,  # window size in bits:
+        #   -15..-8: negate, suppress header
+        #   8..15: normal
+        #   16..30: subtract 16, gzip header
+        zlib.DEF_MEM_LEVEL,  # mem level: 1..8/9
+        0,  # strategy:
+        #   0 = Z_DEFAULT_STRATEGY
+        #   1 = Z_FILTERED
+        #   2 = Z_HUFFMAN_ONLY
+        #   3 = Z_RLE
+        #   4 = Z_FIXED
+    )
+
+
+netcathandler
+
+# This call is asynchronous and non-blocking.
+# It waits for data without freezing the program.
+netcat_packet = await reader.read(self.max_read)
+
+# POTENTIAL BLOCKING CODE STARTS HERE
+# If converting the packet to a DataFrame is CPU-intensive
+# or takes a significant amount of time, it will block the event loop.
+frame = convert_packet_to_dataframe(netcat_packet, self.xml_npfmt)
+
+# These operations are likely fast, but still contribute to the
+# synchronous part of the execution.
+self.pointing_error_y.extend(frame[POINTING_ERROR_X_KEY].values)
+self.pointing_error_x.extend(frame[POINTING_ERROR_Y_KEY].values)
+
+# This Dear PyGui call updates the UI and is also synchronous.
+dpg.set_value(self.pointing_error_series, (self.pointing_error_x, self.pointing_error_y))
+# POTENTIAL BLOCKING CODE ENDS HERE
+
+
+
+"""in progress / unused / abandoned for now"""
+
+import asyncio
+
+import dearpygui.dearpygui as dpg
+import numpy as np
+
+from util.netcat.netcat import convert_packet_to_dataframe
+
+POINTING_ERROR_X_LABEL = "Reported pointing error (deg)"
+POINTING_ERROR_Y_LABEL = "Reported C/N0 (dbHz)"
+
+POINTING_ERROR_X_KEY = "beacon_error_iq(0)"
+POINTING_ERROR_Y_KEY = "beacon_error_iq(1)"
+
+HISTOGRAM_X_LABEL = "Reported C/N0 (db)"
+HISTOGRAM_Y_LABEL = "Counts"
+
+HISTOGRAM_KEY = "bsp_beacon_c_on_n0"
+
+
+class RealTimeNetcatHandler:
+    def __init__(self, internal_ip, internal_port):
+        self.internal_ip = internal_ip
+        self.internal_port = internal_port
+        self.xml_npfmt = None
+        self.internal_netcat_socket = None
+        self.pointing_error_x = []
+        self.pointing_error_y = []
+        self.histogram_x = []
+        self.max_read = 0
+
+    def set_xml_npfmt(self, fmt):
+        self.xml_npfmt = fmt
+        self.packet_length = fmt.itemsize
+        self.max_read = fmt.itemsize * 100
+
+    async def initiate_internal_netcat_socket(self):
+        server = await asyncio.start_server(self.handle_incoming_data, self.internal_ip, self.internal_port)
+        async with server:
+            await server.serve_forever()
+
+    # samstart
+    def _process_packet(self, netcat_packet):
+        """
+        Synchronous method to handle CPU-bound processing of a network packet.
+        This is run in a separate thread to avoid blocking the event loop.
+        """
+        frame = convert_packet_to_dataframe(netcat_packet, self.xml_npfmt)
+        self.pointing_error_y.extend(frame[POINTING_ERROR_X_KEY].values)
+        self.pointing_error_x.extend(frame[POINTING_ERROR_Y_KEY].values)
+        # self.histogram_x.extend(np.round(frame[HISTOGRAM_KEY].values, 1))
+        dpg.set_value(self.pointing_error_series, (self.pointing_error_x, self.pointing_error_y))
+        # dpg.configure_item(self.histogram_series, x=self.histogram_x)
+    # samend
+
+    async def handle_incoming_data(self, reader, writer):
+        while True:
+            if not self.xml_npfmt:
+                await asyncio.sleep(0.02)
+                continue
+            
+            # This part remains non-blocking
+            netcat_packet = await reader.read(self.max_read)
+
+            if not netcat_packet or len(netcat_packet) % self.packet_length != 0:
+                continue
+            
+            # samstart
+            # Run the synchronous, blocking code in a separate thread
+            await asyncio.to_thread(self._process_packet, netcat_packet)
+            # samend
+
+    def generate_pointing_error_plot(self):
+        with dpg.plot(equal_aspects=True, width=300, height=300) as self.pointing_error_plot:
+            self.pointing_error_xaxis = dpg.add_plot_axis(dpg.mvXAxis, label=POINTING_ERROR_X_LABEL)
+            with dpg.plot_axis(dpg.mvYAxis, label=POINTING_ERROR_Y_LABEL) as self.pointing_error_yaxis:
+                l1 = dpg.add_line_series(*self.generate_circle_coordinates(0.3))
+                l2 = dpg.add_line_series(*self.generate_circle_coordinates(0.2))
+                l3 = dpg.add_line_series(*self.generate_circle_coordinates(0.1))
+                [dpg.bind_item_theme(line, "line_series_grey") for line in [l1, l2, l3]]
+                self.pointing_error_series = dpg.add_scatter_series(self.pointing_error_x, self.pointing_error_y)
+                dpg.bind_item_theme(self.pointing_error_series, "scatter_series_small")
+        [dpg.set_axis_limits(axis, -0.3, 0.3) for axis in [self.pointing_error_xaxis, self.pointing_error_yaxis]]
+
+    def generate_histogram_plot(self):
+        with dpg.plot(width=300, height=300) as self.histogram_plot:
+            dpg.add_plot_legend()
+            self.histogram_xaxis = dpg.add_plot_axis(dpg.mvXAxis, label=HISTOGRAM_X_LABEL)
+            #   dpg.set_axis_ticks(self.histogram_xaxis, (("S1", 5), ("S2", 6), ("S3", 7), ("S4", 4), ("S5", 12), ("S6", 13), ("S7", 15), ("S8", 8), ("S9", 9), ("S10", 10)))
+            with dpg.plot_axis(dpg.mvYAxis, label=HISTOGRAM_Y_LABEL) as self.histogram_yaxis:
+                #  pass
+                #   dpg.set_axis_ticks(self.histogram_xaxis, (("5", 1), ("S2", 2), ("S3", 3), ("S4", 4), ("S5", 5), ("S6", 6), ("S7", 7), ("S8", 8), ("S9", 9), ("S10", 10)))
+                #  self.histogram_series = dpg.add_simple_plot(histogram=True, default_value=self.histogram_x)#dpg.add_histogram_series(self.histogram_x)#, bins=69)
+                self.histogram_series = dpg.add_histogram_series(
+                    [], min_range=60, max_range=70, label="histogram", bins=69
+                )
+        # dpg.add_2d_histogram_series([-2,-1,0,1,2], [0,1,2,3,4] , label='Histogram', parent=self.histogram_xaxis)
+
+    def generate_circle_coordinates(self, radius):
+        theta = np.linspace(0, 2 * np.pi, 100)
+        x = radius * np.cos(theta)
+        y = radius * np.sin(theta)
+        return (x, y)
+
+    def clear_plots(self):
+        self.pointing_error_x = []
+        self.pointing_error_y = []
+        self.histogram_x = []
+
+
+
